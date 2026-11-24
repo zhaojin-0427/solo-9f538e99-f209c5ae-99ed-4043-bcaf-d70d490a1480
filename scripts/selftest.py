@@ -177,7 +177,86 @@ def main() -> None:
         response.raise_for_status()
         must(client.get("/conflicts").json()["solvable"] is True, "把 e 更正为 kW/h 后冲突解除")
 
-    print("\n全部自测通过：公式互引、冲突核心、撤回/清单联动、局部重算均符合预期。")
+        print("5) 重复公式：更换冲突依据、沿用候选、撤回末条后重算")
+        response = client.post(
+            "/batches",
+            json={
+                "batch_no": "DUP-1",
+                "known_units": [
+                    {"evidence_no": "DKA", "field": "da", "unit": "kW"},
+                    {"evidence_no": "DKB", "field": "db", "unit": "h"},
+                    {"evidence_no": "DKC", "field": "dc", "unit": "kW"},
+                ],
+                "formulas": [
+                    {"formula_no": "F-201", "result": "dc", "left": "da",
+                     "operator": "*", "right": "db"},
+                    {"formula_no": "F-202", "result": "dc", "left": "da",
+                     "operator": "*", "right": "db"},
+                ],
+            },
+        )
+        response.raise_for_status()
+        dup_batch_id = response.json()["batch_id"]
+        dup_core = {(i["type"], i["id"]) for i in response.json()["unsat_core"]}
+        must(("formula", "F-201") in dup_core, "重复公式求解时以最小编号 F-201 为代表")
+        must(
+            response.json()["recomputed_groups"][0]["formula_count"] == 2,
+            "公式数按有效编号计为 2",
+        )
+
+        response = client.post("/formulas/F-201/withdraw")
+        response.raise_for_status()
+        body = response.json()
+        must(body["status"] == "conflict", "仍有相同有效公式时本批仍报冲突")
+        must(body["recomputed_group_count"] == 0, "相同副本仍在，不重算连通组")
+        must(
+            {(i["type"], i["id"]) for i in body["unsat_core"] if i["type"] == "formula"}
+            == {("formula", "F-202")},
+            "当前冲突依据改用仍有效的 F-202",
+        )
+        basis = next(i for i in body["unsat_core"] if i["type"] == "formula")
+        must(basis["expression"] == "dc = da × db", "新依据带有效编号的正文")
+        current = client.get("/conflicts").json()
+        must(
+            any(
+                i["id"] == "F-202"
+                for g in current["conflicts"]
+                for i in g["conflict_core"]
+                if i["type"] == "formula"
+            ),
+            "GET /conflicts 当前依据也是 F-202",
+        )
+        old_receipt = client.get(f"/batches/{dup_batch_id}").json()
+        must(
+            any(i.get("id") == "F-201" for i in old_receipt["unsat_core"]),
+            "旧批次回执保留当时 F-201 依据",
+        )
+
+        response = client.post("/formulas/F-202/withdraw")
+        response.raise_for_status()
+        body = response.json()
+        must(body["solvable"] is True, "撤回最后一条相同公式后冲突约束消失")
+        warehouse = warehouse_units(client)
+        must(
+            warehouse.get("da") == "kW"
+            and warehouse.get("db") == "h"
+            and warehouse.get("dc") == "kW",
+            "按新连通关系（三个单字段组）重算；DKC 仍使 dc 唯一为 kW",
+        )
+
+        response = client.post("/known-units/DKC/withdraw")
+        response.raise_for_status()
+        dc = candidates(client, "dc")
+        must(len(dc) == 5, f"再撤回 dc 的已知单位后候选恢复为五个单位：{dc}")
+        final_warehouse = warehouse_units(client)
+        must(
+            "dc" not in final_warehouse
+            and final_warehouse.get("da") == "kW"
+            and final_warehouse.get("db") == "h",
+            "dc 不确定后同步移出入仓清单，da/db 保留",
+        )
+
+    print("\n全部自测通过：公式互引、冲突核心、撤回/清单联动、局部重算、重复公式依据切换与末条重算均符合预期。")
 
 
 if __name__ == "__main__":

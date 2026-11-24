@@ -94,7 +94,13 @@ def with_effect(item: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
         "solvable": result["solvable"],
         "conflicts": result["conflicts"],
         "unsat_core": result["unsat_core"],
+        "recomputed_group_count": result.get(
+            "recomputed_group_count", len(result.get("recomputed_groups", []))
+        ),
         "recomputed_groups": result["recomputed_groups"],
+        "reused_group_count": result.get("reused_group_count", 0),
+        "reused_groups": result.get("reused_groups", []),
+        "duplicate_basis_switches": result.get("duplicate_basis_switches", []),
         "warehouse": result["warehouse"],
         "warehouse_count": result["warehouse_count"],
     }

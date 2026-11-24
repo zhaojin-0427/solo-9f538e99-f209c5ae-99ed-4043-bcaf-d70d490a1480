@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from . import models, schemas
@@ -174,6 +174,9 @@ class CatalogService:
         self.db = db
         self.seed_field_ids: Set[int] = set()
         self.old_group_ids: Set[int] = set()
+        # Formula rows whose active flag actually flipped to False in this
+        # batch (idempotent re-withdrawals are not recorded here).
+        self.transitioned_formula_rows: List[models.Formula] = []
 
     def remember(self, field_ids: Iterable[Optional[int]]) -> None:
         ids = {int(value) for value in field_ids if value is not None}
@@ -382,11 +385,14 @@ class CatalogService:
             self.remember(
                 [row.result_field_id, row.left_field_id, row.right_field_id]
             )
+            was_active = bool(row.active)
             if row.active:
                 row.active = False
                 row.withdrawn_at = utcnow()
             row.source_batch_id = batch_id
             self.db.flush()
+            if was_active:
+                self.transitioned_formula_rows.append(row)
             withdrawn_formulas.append(
                 formula_dict(row, self._name_map_for_formula(row))
             )
@@ -400,10 +406,37 @@ class CatalogService:
             )
             self.seed_field_ids.update(row[0] for row in old_members)
 
-        affected = self._recompute_affected(batch_id)
+        # Fast path: a numbered formula is only one registered copy of a
+        # constraint.  When an identical active copy survives, the reasoning
+        # result, candidates and warehouse qualification stay valid: no solver
+        # run and no whole-group formula scan are needed.
+        pure_formula_withdrawals = (
+            not payload.fields
+            and not payload.known_units
+            and not payload.formulas
+            and not known_refs
+            and bool(self.transitioned_formula_rows)
+        )
+        reused_groups: List[Dict[str, Any]] = []
+        basis_switches: List[Dict[str, Any]] = []
+        fast_path_applied = False
+        if pure_formula_withdrawals:
+            fast_path = self._redundant_withdrawal_fast_path(batch_id)
+            if fast_path is not None:
+                reused_groups, basis_switches = fast_path
+                fast_path_applied = True
 
-        feasible_groups = [group for group in affected["groups"] if group["feasible"]]
-        conflict_groups = [group for group in affected["groups"] if not group["feasible"]]
+        if fast_path_applied:
+            recomputed_groups: List[Dict[str, Any]] = []
+        else:
+            affected = self._recompute_affected(batch_id)
+            recomputed_groups = affected["groups"]
+
+        effect_groups = sorted(
+            [*recomputed_groups, *reused_groups],
+            key=lambda item: item["group_key"],
+        )
+        conflict_groups = [group for group in effect_groups if not group["feasible"]]
         status = "effective" if not conflict_groups else "conflict"
 
         warehouse = self.list_warehouse()
@@ -422,9 +455,12 @@ class CatalogService:
                 "known_units": withdrawn_known,
                 "formulas": withdrawn_formulas,
             },
-            "recomputed_group_count": len(affected["groups"]),
-            "recomputed_groups": affected["groups"],
-            "affected_groups": affected["groups"],
+            "recomputed_group_count": len(recomputed_groups),
+            "recomputed_groups": recomputed_groups,
+            "affected_groups": recomputed_groups,
+            "reused_group_count": len(reused_groups),
+            "reused_groups": reused_groups,
+            "duplicate_basis_switches": basis_switches,
             "conflicts": [
                 {
                     "group_id": group["group_id"],
@@ -498,6 +534,223 @@ class CatalogService:
                 names[formula.right_field_id],
             )
 
+    def _find_active_identical_formula(
+        self, row: models.Formula
+    ) -> Optional[models.Formula]:
+        """Return the representative active copy of the same constraint.
+
+        The representative is the surviving active number with the smallest
+        ``formula_no``.  The supplied row is expected to already be flushed as
+        inactive when used by the withdrawal fast path.
+        """
+
+        return (
+            self.db.query(models.Formula)
+            .filter(
+                models.Formula.active.is_(True),
+                models.Formula.id != row.id,
+                models.Formula.result_field_id == row.result_field_id,
+                models.Formula.left_field_id == row.left_field_id,
+                models.Formula.right_field_id == row.right_field_id,
+                models.Formula.operator == row.operator,
+            )
+            .order_by(models.Formula.formula_no.asc(), models.Formula.id.asc())
+            .first()
+        )
+
+    def _active_representative_formulas(
+        self,
+        field_ids: Iterable[int],
+        exclude_internal_ids: Optional[Set[int]] = None,
+    ) -> List[models.Formula]:
+        """Load at most one row per distinct active formula constraint.
+
+        Numbered registrations sharing result/left/right/operator are the same
+        reasoning constraint.  Grouping in SQL keeps duplicate rows out of
+        closure traversal and out of the solver; the representative carries
+        the smallest active ``formula_no``.  Formula *counts* for responses are
+        computed separately with ``COUNT(*)`` so every active number counts.
+        """
+
+        ids = {int(value) for value in field_ids if value is not None}
+        if not ids:
+            return []
+
+        representative_no = (
+            self.db.query(func.min(models.Formula.formula_no))
+            .filter(models.Formula.active.is_(True))
+            .filter(
+                or_(
+                    models.Formula.result_field_id.in_(ids),
+                    models.Formula.left_field_id.in_(ids),
+                    models.Formula.right_field_id.in_(ids),
+                )
+            )
+            .group_by(
+                models.Formula.result_field_id,
+                models.Formula.left_field_id,
+                models.Formula.right_field_id,
+                models.Formula.operator,
+            )
+        )
+        query = self.db.query(models.Formula).filter(
+            models.Formula.formula_no.in_(representative_no)
+        )
+        if exclude_internal_ids:
+            query = query.filter(models.Formula.id.notin_(exclude_internal_ids))
+        return query.order_by(models.Formula.formula_no.asc()).all()
+
+    def _redundant_withdrawal_fast_path(
+        self, batch_id: str
+    ) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+        """Keep projections when an identical active formula survives.
+
+        Returns ``(group_views, basis_switches)`` after applying the
+        bookkeeping, or ``None`` when the caller must run the full scoped
+        recomputation (last copy withdrawn, stale/missing projection, ...).
+        No solver is invoked here and no whole-group formula scan is done.
+        """
+
+        plan: List[Tuple[models.Formula, models.Formula, models.ReasoningGroup]] = []
+        for withdrawn in self.transitioned_formula_rows:
+            twin = self._find_active_identical_formula(withdrawn)
+            if twin is None:
+                # This withdrawal removes the constraint itself.
+                return None
+
+            field_ids = [
+                withdrawn.result_field_id,
+                withdrawn.left_field_id,
+                withdrawn.right_field_id,
+            ]
+            group_rows = (
+                self.db.query(models.FieldEffective.group_id)
+                .filter(models.FieldEffective.field_id.in_(field_ids))
+                .all()
+            )
+            group_pks = {group_pk for (group_pk,) in group_rows}
+            if len(group_pks) != 1:
+                # Missing/stale projections: let the normal recompute repair.
+                return None
+            group = self.db.get(models.ReasoningGroup, next(iter(group_pks)))
+            if group is None:
+                return None
+            plan.append((withdrawn, twin, group))
+
+        switches: List[Dict[str, Any]] = []
+        touched_groups: Dict[int, models.ReasoningGroup] = {}
+        switch_pairs: List[Tuple[models.ReasoningGroup, str, models.Formula]] = []
+
+        for withdrawn, twin, group in plan:
+            old_code = format_formula_no(withdrawn.formula_no)
+            group.formula_count = max(0, int(group.formula_count or 0) - 1)
+            # State was touched (active copy removed / basis rewritten), even
+            # though the reasoning result itself was reused.
+            group.last_batch_id = batch_id
+            touched_groups[group.id] = group
+            switch_pairs.append((group, old_code, twin))
+
+        # Rewrite only current conflict bases that cited a withdrawn number.
+        # Batch result_json rows are never rewritten, so old receipts keep the
+        # basis they were issued with.
+        for group, old_code, twin in switch_pairs:
+            core = list(group.conflict_core or [])
+            cited = any(
+                item.get("type") == "formula" and item.get("id") == old_code
+                for item in core
+                if isinstance(item, dict)
+            )
+            if not cited:
+                continue
+
+            new_code = format_formula_no(twin.formula_no)
+            switches.append(
+                {
+                    "group_id": group.group_key,
+                    "from": old_code,
+                    "to": new_code,
+                    "formula_no": twin.formula_no,
+                    "expression": twin.expression,
+                }
+            )
+            replacement = {
+                "type": "formula",
+                "id": new_code,
+                "formula_code": new_code,
+                "formula_no": twin.formula_no,
+                "expression": twin.expression,
+                "active": True,
+            }
+            rewritten: List[Dict[str, Any]] = []
+            seen: Set[Tuple[str, str]] = set()
+            for item in core:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "formula" and item.get("id") == old_code:
+                    item = replacement
+                key = (str(item.get("type")), str(item.get("id")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rewritten.append(dict(item))
+            group.conflict_core = rewritten
+
+        self.db.flush()
+
+        views = [
+            self._reused_group_view(group)
+            for group in sorted(touched_groups.values(), key=lambda g: g.group_key)
+        ]
+        return views, switches
+
+    def _reused_group_view(
+        self, group: models.ReasoningGroup
+    ) -> Dict[str, Any]:
+        """Build the same effect descriptor as a recomputed group, reading
+        existing projections without deleting or solving them."""
+
+        effective_rows = (
+            self.db.query(models.FieldEffective)
+            .filter(models.FieldEffective.group_id == group.id)
+            .all()
+        )
+        component = sorted(row.field_id for row in effective_rows)
+        field_rows = (
+            self.db.query(models.Field)
+            .filter(models.Field.id.in_(component))
+            .all()
+        )
+        names_by_id = {row.id: row.name for row in field_rows}
+        for field_id in component:
+            names_by_id.setdefault(field_id, f"field_{field_id}")
+
+        candidates_json: Dict[str, List[str]] = {}
+        unique_json: Dict[str, str] = {}
+        for row in effective_rows:
+            name = names_by_id[row.field_id]
+            units = list(row.candidates or [])
+            candidates_json[name] = units
+            if row.unique_unit:
+                unique_json[name] = row.unique_unit
+
+        return {
+            "group_id": group.group_key,
+            "group_key": group.group_key,
+            "group_pk": group.id,
+            "version": group.version,
+            "fields": sorted(names_by_id[field_id] for field_id in component),
+            "field_ids": component,
+            "feasible": group.feasible,
+            "candidates": candidates_json,
+            "unique_units": unique_json,
+            "conflict_core": list(group.conflict_core or []),
+            "formula_count": group.formula_count,
+            "known_count": group.known_count,
+            # Indicates no solver/rebuild happened for this group.
+            "recomputed": False,
+            "dedup_reused": True,
+        }
+
     def _formula_closure(self, seed_ids: Set[int]) -> Tuple[Set[int], Set[int]]:
         """Traverse only active formula hyperedges touching the seed fields."""
 
@@ -506,23 +759,13 @@ class CatalogService:
         formula_ids: Set[int] = set()
 
         while frontier:
-            rows = (
-                self.db.query(models.Formula)
-                .filter(
-                    models.Formula.active.is_(True),
-                    or_(
-                        models.Formula.result_field_id.in_(frontier),
-                        models.Formula.left_field_id.in_(frontier),
-                        models.Formula.right_field_id.in_(frontier),
-                    ),
-                )
-                .all()
+            # One representative per distinct constraint is enough for the
+            # hypergraph connectivity traversal; never reprocess a rep.
+            rows = self._active_representative_formulas(
+                frontier, exclude_internal_ids=formula_ids
             )
             new_fields: Set[int] = set()
             for formula in rows:
-                if formula.id in formula_ids:
-                    # Still safe to inspect; all its fields were added before.
-                    pass
                 formula_ids.add(formula.id)
                 ids = {
                     formula.result_field_id,
@@ -551,18 +794,9 @@ class CatalogService:
         for field_id in reached_ids:
             field_names.setdefault(field_id, f"field_{field_id}")
 
-        formula_rows = (
-            self.db.query(models.Formula)
-            .filter(
-                models.Formula.active.is_(True),
-                or_(
-                    models.Formula.result_field_id.in_(reached_ids),
-                    models.Formula.left_field_id.in_(reached_ids),
-                    models.Formula.right_field_id.in_(reached_ids),
-                ),
-            )
-            .all()
-        )
+        # One ORM row per distinct constraint; identical numbered registrations
+        # must not be solved as separate constraints.
+        formula_rows = self._active_representative_formulas(reached_ids)
         known_rows = (
             self.db.query(models.KnownUnit)
             .filter(
@@ -664,7 +898,21 @@ class CatalogService:
                 self.db.add(group)
             group.feasible = True
             group.conflict_core = []
-            group.formula_count = len(comp_formula_rules)
+            # Counts every active numbered registration, including identical
+            # copies; comp_formula_rules only has representative constraints.
+            group.formula_count = (
+                self.db.query(func.count(models.Formula.id))
+                .filter(models.Formula.active.is_(True))
+                .filter(
+                    or_(
+                        models.Formula.result_field_id.in_(component),
+                        models.Formula.left_field_id.in_(component),
+                        models.Formula.right_field_id.in_(component),
+                    )
+                )
+                .scalar()
+                or 0
+            )
             group.known_count = len(comp_known_rules)
             group.version += 1
             group.last_batch_id = batch_id

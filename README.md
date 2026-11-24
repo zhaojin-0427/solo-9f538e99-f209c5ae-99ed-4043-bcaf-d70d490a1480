@@ -172,6 +172,18 @@ F-10: energy = power * hours
 - `energy` 候选为 `["kW", "kWh"]`；
 - `hours`、`energy` 在同一事务中从 `warehouse_entries` 删除。
 
+### 同一公式的多个编号（重复登记）
+
+同一条电耗公式可能用不同 `formula_no` 登记多次。只要 **结果字段、左字段、右字段（左右顺序也参与比较）和运算符** 完全相同，就视为同一条约束：
+
+- 求解和连通关系中，每种有效公式只读入一条代表记录（当前取有效编号中 `formula_no` 最小者），不会把副本当成多条约束；
+- `reasoning_groups.formula_count` 与响应中的 `formula_count` 仍按**有效编号条数**统计，登记 `F-001`/`F-002` 两份时为 `2`，撤回一份后为 `1`；
+- 在 `/docs` 按编号撤回其中一条时，只要还有相同的有效公式，候选单位、组 ID/版本和入仓资格全部沿用，不调用求解器、也不扫描整组公式；批次响应中 `recomputed_group_count=0`，复用的组放在 `reused_groups`；
+- 若当前冲突核心引用了被撤回的编号，当前 `reasoning_groups.conflict_core` 与本批 `unsat_core` 会把该条**更换为仍有效的编号和正文**（响应的 `duplicate_basis_switches` 记录 `from -> to`），本批 `status` 仍为 `conflict`；历史批次回执 `batches.result_json` 不改写，仍保留出具时的依据；
+- 撤回最后一条相同的有效公式时，约束/超边消失，按新的连通闭包重算（组可能分裂），并照常更新 `field_effective` 与 `warehouse_entries`；
+- 一个批次同时撤回某约束的全部副本时，同样走完整重算；混合了已知单位写入、公式更正等其他变更的批次也始终走完整局部重算以保证正确；
+- 撤回状态、冲突依据、候选和清单在同一个 SQLite 事务提交；批次中任一编号不存在等错误会整体回滚，之后查询仍是原状态。
+
 ## 5. 无解冲突集合
 
 若约束无解，批次仍保存合法目录证据，并返回一个删除序下的极小冲突集合。例如：
@@ -246,11 +258,11 @@ docker-compose.yml
 
 ## 8. 已执行的自测
 
-在交付环境中实际执行：
+在交付环境中实际执行（依赖安装在 `/tmp/pylibs`）：
 
 ```bash
 PYTHONPATH=/tmp/pylibs:/workspace python3 -m pytest /workspace/tests -q
-# 8 passed
+# 15 passed
 ```
 
 测试覆盖：
@@ -262,30 +274,39 @@ PYTHONPATH=/tmp/pylibs:/workspace python3 -m pytest /workspace/tests -q
 - 撤回公式后候选恢复为五个单位；
 - 更正公式时只重算受影响连通组，其他组版本号不变；
 - 非法撤回的原子性；
-- `/health` 与 `/docs`。
+- `/health` 与 `/docs`；
+- 重复公式：两份相同编号只算一条约束、`formula_count` 按有效编号计为 2；
+- 撤回其中一份时 `solve_group` 调用数为 0、候选/组版本/清单完全不变；
+- 冲突依据从 `F-001` 换到幸存副本 `F-002`（编号与正文），本批仍报冲突，而旧批次回执保留 `F-001`；
+- 撤回未被核心引用的副本时不改依据；随后撤回末条时冲突解除并按分裂后的连通关系更新清单；
+- 同一批次撤回全部副本、混合非法编号整体回滚、左右交换不算同一约束。
 
 可读自测脚本也已实际通过：
 
 ```bash
 pip install -r requirements-dev.txt
 PYTHONPATH=. python3 scripts/selftest.py
-# 14 项断言全部通过
+# 26 项断言全部通过
 ```
 
-另外用固定随机种子生成 3000 个小型公式组，将求解器候选与 `itertools.product` 穷举结果对照，结果为 `0` 失配。
+另外用固定随机种子生成小型公式组，将求解器候选与 `itertools.product` 穷举结果对照，结果为 `0` 失配（`tests/test_reasoning_random.py`，随套件一起通过）。
 
-还实际启动过 Uvicorn 并验证：
+还实际启动过 Uvicorn（真实 HTTP，非仅 TestClient）并验证：
 
 ```text
 GET /health       -> {"status":"ok"}
-GET /docs         -> Swagger UI 页面
-GET /openapi.json -> 正常生成路径
+GET /docs         -> Swagger UI 页面（200）
+GET /openapi.json -> 正常生成路径（200）
 POST /batches     -> 字符串循环公式可解析并正确推断
+POST /formulas/F-001/withdraw -> 冲突依据切换为 F-002、recomputed_group_count=0
+DELETE /formulas/F-002         -> 撤回末条后重算，/conflicts count=0
 ```
+
+并用同一个文件型 SQLite 库**重启 Uvicorn 进程**，确认撤回状态、改写后的当前冲突依据 `F-002` 在重启后仍然存在（对应 Docker 命名卷 `gsb-unit-catalog-data` 的沿用旧卷场景；本次未改 ORM 表结构，旧库可直接启动，`create_all` 仅做幂等建表）。
 
 ## 9. 余项与限制
 
-- 当前交付沙箱中没有 `docker` / `docker compose` 可执行文件，因此未能在这里实际执行 `docker compose build/up`；已校验 `docker-compose.yml` 的 YAML 语法、Dockerfile 启动命令和应用本身的 Uvicorn/HTTP 行为。目标机器具备 Docker Compose v2 时可直接 `docker compose up --build`。
-- 冲突核心是删除序下的极小不可满足集合，不保证是所有可能核心中证据条数最少的一个；接口返回的集合一定不能同时成立。
+- 当前交付沙箱中没有 `docker` / `docker compose` / Podman 可执行文件，也没有可连接的 Docker daemon，因此未能在这里实际执行 `docker compose build/up`；已用 PyYAML 校验 `docker-compose.yml` 语法与服务/卷配置、核对 Dockerfile 启动命令，并用等价的本地 Uvicorn + 文件 SQLite（含重启沿用）实测通过。目标机器具备 Docker Compose v2 时可直接 `docker compose up --build`；命名卷仍为 `gsb-unit-catalog-data`，不会新建或清空旧卷。
+- 冲突核心是删除序下的极小不可满足集合，不保证是所有可能核心中证据条数最少的一个；接口返回的集合一定不能同时成立。重复公式的代表记录取有效编号中 `formula_no` 最小者，因此新登记冲突核心通常引用最小编号；旧库中已经落库的核心编号不会在启动时被改写，只在撤回该编号时换到幸存副本。
 - 求解器对每个字段的每个候选单位执行一次可行性搜索，并在组内使用 GAC + MRV 回溯。普通报表公式规模足够；若单个连通组包含大量高度耦合公式，后续可再加入量纲线性方程消元或增量传播来降低搜索量。连通组之间始终隔离，更正不会重算全库。
 - 当前没有做用户鉴权；这是内网入仓前目录服务，如需跨团队暴露应放在鉴权网关后或补充认证。
