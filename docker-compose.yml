@@ -1,0 +1,27 @@
+services:
+  unit-catalog:
+    build:
+      context: .
+    image: gsb-unit-catalog:latest
+    container_name: gsb-unit-catalog
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////data/catalog.db
+    volumes:
+      - catalog-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  catalog-data:
+    name: gsb-unit-catalog-data
